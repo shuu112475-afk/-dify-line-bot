@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -17,14 +17,12 @@ from app.models.database import (
     get_db,
 )
 from app.services import dify_service, line_service, session_service
-from app.worker.tasks import process_message_task
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
 def _source_key(source: Dict[str, Any]) -> tuple[str, str, str]:
-    """Returns (line_user_id, channel_type, thread_key)."""
     src_type = source.get("type", "user")
     user_id = source.get("userId", "")
     if src_type == "group":
@@ -73,10 +71,9 @@ def _get_or_create_session(db: Session, line_user_id: str, src_type: str, thread
 
 
 @router.post("/webhooks/line")
-async def line_webhook(request: Request):
+async def line_webhook(request: Request, background_tasks: BackgroundTasks):
     raw_body = await request.body()
 
-    # Signature verification must happen before any processing
     signature = request.headers.get("x-line-signature")
     line_service.verify_signature(raw_body, signature)
 
@@ -84,7 +81,6 @@ async def line_webhook(request: Request):
     body = json.loads(raw_body.decode("utf-8"))
     events = body.get("events", [])
 
-    # URL verification POST has no events
     if not events:
         return JSONResponse({"ok": True})
 
@@ -92,18 +88,15 @@ async def line_webhook(request: Request):
         webhook_event_id = event.get("webhookEventId", "")
         is_redelivery = event.get("deliveryContext", {}).get("isRedelivery", False)
 
-        # Deduplication: skip already-processed events (idempotency)
         if webhook_event_id and await session_service.is_duplicate_event(webhook_event_id):
             logger.info("duplicate_event_skipped", extra={"webhook_event_id": webhook_event_id})
             continue
 
-        # Ignore standby mode (multi-bot setups)
         if event.get("mode") == "standby":
             continue
 
         event_type = event.get("type", "")
 
-        # Persist webhook event for audit
         try:
             raw_hash = hashlib.sha256(raw_body).hexdigest()
             db_gen = get_db()
@@ -122,15 +115,13 @@ async def line_webhook(request: Request):
         except Exception:
             logger.exception("webhook_audit_write_failed")
 
-        # Route by event type
         if event_type == "message":
-            await _handle_message_event(event)
+            background_tasks.add_task(_handle_message_event, event)
         elif event_type == "follow":
-            await _handle_follow_event(event)
+            background_tasks.add_task(_handle_follow_event, event)
         elif event_type == "unfollow":
-            await _handle_unfollow_event(event)
+            background_tasks.add_task(_handle_unfollow_event, event)
 
-    # Always return 200 quickly so LINE doesn't retry
     return JSONResponse({"ok": True})
 
 
@@ -153,7 +144,6 @@ async def _handle_message_event(event: Dict[str, Any]) -> None:
         chat_session = _get_or_create_session(db, line_user_id, src_type, thread_key)
         session_id = chat_session.session_id
 
-        # Log inbound message
         msg_log = MessageLog(
             session_id=session_id,
             direction="inbound",
@@ -169,30 +159,99 @@ async def _handle_message_event(event: Dict[str, Any]) -> None:
 
     if msg_type == "text":
         user_text = message.get("text", "")
-        # Enqueue to worker (async processing recommended for production)
-        # In this implementation we call directly but mark it as a background task approach
-        process_message_task.delay(
-            session_id=session_id,
-            line_user_id=line_user_id,
-            dify_user=dify_user,
-            reply_token=reply_token,
-            user_text=user_text,
-            message_log_id=message_log_id,
-        )
     elif msg_type in ("image", "audio", "video", "file"):
-        message_id = message.get("id", "")
-        process_message_task.delay(
-            session_id=session_id,
-            line_user_id=line_user_id,
-            dify_user=dify_user,
-            reply_token=reply_token,
-            user_text=f"[{msg_type}ファイルが送信されました]",
-            message_log_id=message_log_id,
-            line_message_id=message_id,
-            msg_type=msg_type,
-        )
+        user_text = f"[{msg_type}ファイルが送信されました]"
     else:
         logger.info("unsupported_message_type", extra={"type": msg_type})
+        return
+
+    await _process_and_reply(
+        session_id=session_id,
+        line_user_id=line_user_id,
+        dify_user=dify_user,
+        reply_token=reply_token,
+        user_text=user_text,
+    )
+
+
+async def _process_and_reply(
+    session_id: str,
+    line_user_id: str,
+    dify_user: str,
+    reply_token: str,
+    user_text: str,
+) -> None:
+    try:
+        conversation_id = await session_service.get_conversation_id(line_user_id) or ""
+
+        if not conversation_id:
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                mapping = db.query(DifyConversationMap).filter_by(session_id=session_id).first()
+                if mapping:
+                    conversation_id = mapping.dify_conversation_id or ""
+            finally:
+                db.close()
+
+        dify_resp = await dify_service.chat(
+            query=user_text,
+            dify_user=dify_user,
+            conversation_id=conversation_id,
+            inputs={"channel": "line", "locale": "ja-JP"},
+        )
+
+        answer = dify_resp.get("answer", "")
+        new_conv_id = dify_resp.get("conversation_id", "")
+
+        if new_conv_id:
+            await session_service.set_conversation_id(line_user_id, new_conv_id)
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                mapping = db.query(DifyConversationMap).filter_by(session_id=session_id).first()
+                if mapping:
+                    mapping.dify_conversation_id = new_conv_id
+                    mapping.updated_at = datetime.now(timezone.utc)
+                else:
+                    db.add(DifyConversationMap(
+                        session_id=session_id,
+                        dify_user_key=dify_user,
+                        dify_conversation_id=new_conv_id,
+                    ))
+                db.commit()
+            finally:
+                db.close()
+
+        reply_text = answer if answer else "申し訳ありません。回答の生成に失敗しました。"
+        token_fresh = await session_service.mark_reply_token_used(reply_token)
+
+        if token_fresh:
+            try:
+                await line_service.send_reply(
+                    reply_token,
+                    [line_service.build_text_message(reply_text)],
+                )
+            except Exception:
+                await line_service.send_push(
+                    line_user_id,
+                    [line_service.build_text_message(reply_text)],
+                )
+        else:
+            await line_service.send_push(
+                line_user_id,
+                [line_service.build_text_message(reply_text)],
+            )
+
+    except Exception:
+        logger.exception("process_and_reply_failed")
+        try:
+            await line_service.send_push(
+                line_user_id,
+                [line_service.build_error_message()],
+            )
+        except Exception:
+            logger.exception("error_push_also_failed")
 
 
 async def _handle_follow_event(event: Dict[str, Any]) -> None:
