@@ -6,7 +6,6 @@ sqlalchemy==2.0.35
 alembic==1.13.3
 psycopg[binary]==3.2.1
 pydantic-settings==2.5.2
-celery[redis]==5.4.0
 python-multipart==0.0.9
 structlog==24.4.0
 sentry-sdk[fastapi]==2.14.0
