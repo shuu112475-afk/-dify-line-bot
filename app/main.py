@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.models.database import Base, engine
 from app.routers import health, webhook
 
 logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
@@ -25,6 +26,8 @@ if settings.sentry_dsn:
         integrations=[FastApiIntegration()],
         environment=settings.app_env,
     )
+
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="LINE-Dify Integration Bot",
