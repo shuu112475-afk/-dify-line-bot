@@ -29,7 +29,7 @@ def verify_signature(raw_body: bytes, signature: Optional[str]) -> None:
 
 def _auth_headers() -> Dict[str, str]:
     return {
-        "Authorization": f"Bearer {settings.line_channel_access_token}",
+        "Authorization": f"Bearer {settings.line_channel_access_token.strip()}",
         "Content-Type": "application/json",
     }
 
