@@ -1,0 +1,106 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: linebot
+          POSTGRES_PASSWORD: linebot
+          POSTGRES_DB: linebot
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      LINE_CHANNEL_SECRET: test_secret
+      LINE_CHANNEL_ACCESS_TOKEN: test_token
+      DIFY_API_KEY: test_dify_key
+      DIFY_API_BASE_URL: https://api.dify.ai/v1
+      DATABASE_URL: postgresql+psycopg://linebot:linebot@localhost:5432/linebot
+      REDIS_URL: redis://localhost:6379/0
+      APP_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt respx pytest-asyncio
+
+      - name: Apply DB schema
+        run: psql "$DATABASE_URL" -f migrations/init.sql
+        env:
+          DATABASE_URL: postgresql://linebot:linebot@localhost:5432/linebot
+
+      - name: Run tests
+        run: pytest -q --tb=short
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          dockerfile: Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}/line-dify-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push Worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          dockerfile: Dockerfile.worker
+          push: true
+          tags: ghcr.io/${{ github.repository }}/line-dify-worker:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Deploy to Cloud Run / App Runner / Azure Container Apps
+        run: |
+          echo "Deploy image: ghcr.io/${{ github.repository }}/line-dify-api:${{ github.sha }}"
+          echo "Add your cloud-specific deploy step here (gcloud run deploy, aws apprunner, az containerapp update)"
