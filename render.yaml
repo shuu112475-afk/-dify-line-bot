@@ -60,6 +60,9 @@ services:
   - type: redis
     name: dify-line-redis
     plan: free
+    ipAllowList:
+      - source: 0.0.0.0/0
+        description: Allow all
 
 databases:
   - name: dify-line-db
