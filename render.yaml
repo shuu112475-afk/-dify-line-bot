@@ -57,12 +57,12 @@ services:
       - key: LOG_LEVEL
         value: INFO
 
+  - type: redis
+    name: dify-line-redis
+    plan: free
+
 databases:
   - name: dify-line-db
     plan: free
     databaseName: linebot
     user: linebot
-
-  - type: redis
-    name: dify-line-redis
-    plan: free
